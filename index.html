@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Network Device Cards</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-200 text-gray-800">
+  <div class="max-w-md mx-auto p-4 space-y-4">
+    <label for="fileInput" class="block w-full text-center bg-blue-600 text-white py-2 px-4 rounded cursor-pointer hover:bg-blue-700 transition">Upload Network Data (.xlsx)</label>
+    <input type="file" id="fileInput" accept=".xlsx" class="hidden" />
+    <div id="deviceCards" class="space-y-4"></div>
+  </div>
+
+  <script>
+    let groupedDevices = {};
+    let routingGraph = {};
+    let orderedDeviceNames = [];
+
+    const deviceCards = document.getElementById('deviceCards');
+
+    function getPortDetails(deviceName, portNumber) {
+      const portList = groupedDevices[deviceName];
+      if (!Array.isArray(portList)) return '';
+      const port = portList.find(p => p['Port Number'] == portNumber);
+      if (!port) return '';
+
+      const lines = [];
+      if (port['Port Number']) lines.push(`Port ${port['Port Number']}`);
+      if (port['VLAN'] && port['VLAN'] !== 'N/A') lines.push(`VLAN: ${port['VLAN']}`);
+      if (port['Trunk'] && port['Trunk'] !== 'N/A') lines.push(`Trunk: ${port['Trunk']}`);
+
+      return lines.join('<br>');
+    }
+
+    function isSpecialDevice(name, ports) {
+      const normalized = name.trim().toLowerCase();
+      return ['spare', 'organizer', 'orginizer'].includes(normalized) || !Array.isArray(ports) || ports.length === 0;
+    }
+
+    function createCard(deviceName, ports = [], highlightPort = null, connectionInfo = null, detailText = '') {
+      const special = isSpecialDevice(deviceName, ports);
+      const card = document.createElement('div');
+      card.className = `rounded p-4 border border-gray-300 shadow-lg ${special ? 'bg-white/70 text-gray-500' : 'bg-white'}`;
+      card.innerHTML = `
+        <h2 class="text-lg font-bold mb-2">${deviceName}</h2>
+        ${!special ? `<div class="grid grid-cols-6 gap-1 text-sm">
+          ${ports.map(p => {
+            const portId = `${p['Device Name']}-${p['Port Number']}`;
+            const isHighlighted = highlightPort === portId ? 'bg-yellow-300' : 'bg-gray-200';
+            return `<div class="${isHighlighted} p-1 rounded text-center cursor-pointer text-xs font-mono" data-port="${portId}">${p['Port Number'] || '?'}</div>`;
+          }).join('')}
+        </div>` : ''}
+        <div class="mt-2 text-xs text-blue-700">${connectionInfo || ''}</div>
+        ${detailText ? `<div class="mt-1 text-xs text-gray-600">${detailText}</div>` : ''}
+      `;
+      return card;
+    }
+
+    function addToRoutingGraph(a, b) {
+      if (!routingGraph[a]) routingGraph[a] = new Set();
+      if (!routingGraph[b]) routingGraph[b] = new Set();
+      routingGraph[a].add(b);
+      routingGraph[b].add(a);
+    }
+
+    function getDeviceName(portId) {
+      return portId.split('-')[0];
+    }
+
+    function getCanonicalChain(startPortId) {
+      const visited = new Set();
+      const chain = [];
+
+      function dfs(current, parent = null) {
+        if (visited.has(current)) return;
+        visited.add(current);
+
+        for (const neighbor of routingGraph[current] || []) {
+          if (neighbor !== parent) dfs(neighbor, current);
+        }
+        chain.push(current); // post-order to reverse the direction
+      }
+
+      dfs(startPortId);
+      return chain.reverse();
+    }
+
+    function renderAllCards() {
+      deviceCards.innerHTML = '';
+      orderedDeviceNames.forEach(deviceName => {
+        const ports = Array.isArray(groupedDevices[deviceName]) ? groupedDevices[deviceName] : [];
+        const card = createCard(deviceName, ports);
+        deviceCards.appendChild(card);
+      });
+    }
+
+    document.addEventListener('click', function (event) {
+      if (!event.target.closest('[data-port]')) renderAllCards();
+    });
+
+    document.getElementById('fileInput').addEventListener('change', function (event) {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = function (e) {
+        const data = new Uint8Array(e.target.result);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const devices = XLSX.utils.sheet_to_json(workbook.Sheets['Devices'] || {});
+        const racks = XLSX.utils.sheet_to_json(workbook.Sheets['Racks'] || {});
+        const routing = XLSX.utils.sheet_to_json(workbook.Sheets['Routing'] || {});
+
+        groupedDevices = {};
+        routingGraph = {};
+        orderedDeviceNames = [];
+
+        devices.forEach(row => {
+          const name = row['Device Name'];
+          if (!groupedDevices[name]) groupedDevices[name] = [];
+          groupedDevices[name].push(row);
+        });
+
+        racks.sort((a, b) => a['Device Order'] - b['Device Order']).forEach(row => {
+          if (row['Device Name'] in groupedDevices) {
+            orderedDeviceNames.push(row['Device Name']);
+          }
+        });
+
+        routing.forEach(row => {
+          const a = `${row['Source']}-${row['Source Port']}`;
+          const b = `${row['Destination']}-${row['Destination Port']}`;
+          addToRoutingGraph(a, b);
+        });
+
+        renderAllCards();
+
+        deviceCards.addEventListener('click', e => {
+          const portDiv = e.target.closest('[data-port]');
+          if (!portDiv) return;
+
+          const startPortId = portDiv.dataset.port;
+          const orderedPath = getCanonicalChain(startPortId);
+
+          const rendered = new Set();
+          deviceCards.innerHTML = '';
+
+          orderedPath.forEach(portId => {
+            const [device, port] = portId.split('-');
+            if (rendered.has(device)) return;
+            rendered.add(device);
+            const details = getPortDetails(device, port);
+            deviceCards.appendChild(
+              createCard(device, groupedDevices[device], portId, `Connected via ${portId}`, details)
+            );
+          });
+        });
+      };
+      reader.readAsArrayBuffer(file);
+    });
+  </script>
+</body>
+</html>
